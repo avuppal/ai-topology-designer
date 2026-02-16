@@ -30,12 +30,24 @@ def optimal_topology(params, num_gpus, bw_gbps=400):
     
     return tp, pp, dp
 
-def est_time(params, num_gpus, epochs=1):
-    """Rough FLOPs-based time (sec)."""
-    flops = 6 * params * SEQ_LEN  # Chinchilla FLOPs (fwd+bwd+opt)
-    total_flops = flops * epochs * num_gpus
-    time_sec = total_flops / FLOPS_PER_SEC
-    return time_sec / 3600  # Hours
+def est_time(params, num_gpus, tp, pp, dp, epochs=1, layers=80, bw_gbps=400):
+    """Est. time with comm + bubble."""
+    # Compute FLOPs
+    flops = 6 * params * SEQ_LEN  # Chinchilla
+    compute_sec = (flops * epochs) / FLOPS_PER_SEC
+    
+    # AllReduce comm (gradient size ~ model_gb * 4 bytes)
+    model_gb = memory_footprint(params)
+    grad_gb = model_gb * 4  # FP32 grads
+    comm_per_step = grad_gb * dp / (bw_gbps / 8)  # GB / GBps = sec
+    comm_sec = comm_per_step * epochs
+    
+    # Pipeline bubble (~ (layers-1)/PP * step_time)
+    bubble_factor = max(0, (layers - 1) / pp)
+    bubble_sec = compute_sec * bubble_factor / num_gpus
+    
+    total_sec = compute_sec + comm_sec + bubble_sec
+    return total_sec / 3600  # Hours
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
