@@ -1,60 +1,150 @@
 # AI Topology Designer
 
-## Overview
+[![CI](https://github.com/avuppal/ai-topology-designer/actions/workflows/ci.yml/badge.svg)](https://github.com/avuppal/ai-topology-designer/actions/workflows/ci.yml)
 
-This project is a Python tool for generating, evaluating, and visualizing network topologies optimized for AI infrastructure, such as GPU clusters for distributed training. It supports common topologies like ring, torus, hypercube, and fat-tree, with metrics for performance analysis. Ideal for simulating designs in enterprise AI environments where topology impacts latency, bandwidth, and scalability.
+Tools for planning distributed LLM training deployments. Given a model size, cluster size, and network bandwidth, the toolkit computes the optimal parallelism strategy (Tensor / Pipeline / Data parallel) and estimates wall-clock training time, including AllReduce communication and pipeline-bubble overhead.
 
-Key features:
-- Generate topologies programmatically.
-- Evaluate metrics like diameter, bandwidth, and average path length.
-- Simulate basic traffic patterns.
-- Visualize graphs for intuitive understanding.
+---
 
-## Tech Stack
-- Python 3.x
-- NetworkX for graph operations
-- Matplotlib for visualization
-- Argparse for CLI
+## Tools
 
-## Setup Instructions
+| Script | Purpose |
+|---|---|
+| `topology_designer.py` | Core library: `memory_footprint`, `optimal_topology`, `est_time` |
+| `napkin_solver.py` | Interactive/importable quick estimator returning a `NapkinResult` dataclass |
 
-1. **Prerequisites**:
-   ```
-   pip install networkx matplotlib
-   ```
+---
 
-2. **Clone the Repo**:
-   ```
-   git clone https://github.com/avuppal/ai-topology-designer.git
-   cd ai-topology-designer
-   ```
+## Parallelism Strategy
 
-3. **Run the Script**:
-   ```
-   python topology_designer.py --topology ring --num_nodes 8
-   ```
-   See `--help` for options.
+```mermaid
+flowchart TD
+    A[Model Size + Cluster Size] --> B{Model fits in one GPU?}
+    B -- No --> C[Tensor Parallelism\nSplit weight matrices across TP GPUs]
+    B -- Yes --> D[TP = 1]
+    C --> E[Remaining GPUs = total // TP]
+    D --> E
+    E --> F[Pipeline Parallelism\nPP = floor √remaining]
+    F --> G[Data Parallelism\nDP = remaining // PP]
+    G --> H[Training Configuration\nTP × PP × DP GPUs]
+```
 
-## Usage
+---
 
-- **Generate and Evaluate**:
-  - Ring: `--topology ring --num_nodes 16`
-  - Torus: `--topology torus --rows 4 --cols 4`
-  - Hypercube: `--topology hypercube --dim 4`
-  - Fat-tree: `--topology fat_tree --pods 4 --servers_per_rack 4`
+## Time Estimation
 
-- **Metrics**: Outputs node/edge counts, degree, diameter, avg shortest path, bisection bandwidth approx.
-- **Simulation**: Runs random traffic simulation for avg hops.
-- **Visualization**: Displays graph with appropriate layout.
+Training time has three components:
 
-## Potential Improvements
-- Integrate real AI workload simulations (e.g., all-reduce patterns).
-- Add optimization algorithms for custom topologies.
-- Support for link capacities and fault injection.
-- Web-based UI for interactive design.
+```mermaid
+flowchart LR
+    A[Total Training Time] --> B[Compute\n6 · params · seq_len FLOPs\ndistributed across all GPUs]
+    A --> C[AllReduce Comm\nfp32 gradients across DP group\nring-allreduce per step]
+    A --> D[Pipeline Bubble\nPP-1 idle micro-batch slots\nper pipeline stage boundary]
+```
 
-## Contributing
-Fork, make changes, and PR. Focus on adding new topologies or metrics.
+---
+
+## Memory Layout
+
+```mermaid
+graph TD
+    subgraph DP Group ["Data Parallel (DP replicas)"]
+        subgraph TP0 ["TP Shard 0"]
+            P0[PP Stage 0\nGPU 0]
+            P1[PP Stage 1\nGPU 1]
+            P2[PP Stage 2\nGPU 2]
+        end
+        subgraph TP1 ["TP Shard 1"]
+            P3[PP Stage 0\nGPU 3]
+            P4[PP Stage 1\nGPU 4]
+            P5[PP Stage 2\nGPU 5]
+        end
+    end
+    P0 -- activation --> P1
+    P1 -- activation --> P2
+    P3 -- activation --> P4
+    P4 -- activation --> P5
+    P0 <-- AllReduce grad --> P3
+```
+
+---
+
+## Quick Start
+
+```bash
+git clone https://github.com/avuppal/ai-topology-designer.git
+cd ai-topology-designer
+pip install pytest ruff   # dev tools only; no extra runtime deps needed
+```
+
+### Interactive napkin math
+
+```bash
+python napkin_solver.py
+# Params (e.g. 1e12 for 1T) [1e12]:
+# GPUs (e.g. 1000) [1000]:
+# Network BW Gbps [400]:
+#
+# Model       : 1.00T params  (2000.0 GB fp16)
+# Cluster     : 1000 H100s
+# Parallelism : TP=25  PP=6  DP=6
+# Compute     : 0.007 hr
+# AllReduce   : 27.307 hr
+# PP bubble   : 0.000 hr
+# Total       : 27.314 hr
+```
+
+### As a library
+
+```python
+from napkin_solver import solve
+
+result = solve(params=70e9, gpus=512, bw_gbps=400)
+print(result)
+# Model       : 0.07T params  (140.0 GB fp16)
+# Cluster     : 512 H100s
+# Parallelism : TP=2  PP=11  DP=23
+# ...
+```
+
+```python
+from topology_designer import optimal_topology, est_time, memory_footprint
+
+tp, pp, dp = optimal_topology(params=70e9, num_gpus=512)
+hours = est_time(70e9, 512, tp, pp, dp, epochs=1, bw_gbps=400)
+```
+
+---
+
+## H100 Reference Constants
+
+| Constant | Value | Notes |
+|---|---|---|
+| HBM per GPU | 80 GB | HBM3 (SXM5) |
+| fp16 FLOPS | 1 979 TFLOPS | peak, fwd+bwd |
+| Default seq len | 4 096 tokens | — |
+| Default BW | 400 Gbps | InfiniBand NDR |
+
+---
+
+## Running Tests
+
+```bash
+pytest tests/ -v
+# 38 passed in 0.09s
+```
+
+---
+
+## Roadmap
+
+- Ring-allreduce comm model with `O((dp-1)/dp)` saturation (current model is linear)
+- MoE expert parallelism dimension
+- Cost estimator ($/hr) for major cloud providers
+- JSON/YAML topology export for cluster provisioning scripts
+
+---
 
 ## License
-MIT License.
+
+MIT
